@@ -73,13 +73,38 @@ from pathlib import Path
 import sys
 
 library = Path(sys.argv[1])
-data = library.read_bytes()
+data = bytearray(library.read_bytes())
 compiled_path = b"/usr/lib/x86_64-linux-gnu/webkit2gtk-4.1"
-replacement = b"." + (b"\0" * (len(compiled_path) - 1))
-count = data.count(compiled_path)
-if count != 1:
-    raise SystemExit(f"expected one WebKit helper path, found {count}")
-library.write_bytes(data.replace(compiled_path, replacement, 1))
+plen = len(compiled_path)
+
+# This string can appear more than once: once as the standalone helper
+# directory, and once as a prefix of the longer injected-bundle path
+# (".../webkit2gtk-4.1/injected-bundle/"). Patch every occurrence in
+# place, byte-for-byte, so the file's length never changes.
+positions = []
+start = 0
+while True:
+    idx = data.find(compiled_path, start)
+    if idx == -1:
+        break
+    positions.append(idx)
+    start = idx + 1
+
+if not positions:
+    raise SystemExit("expected at least one WebKit helper path, found 0")
+
+for idx in positions:
+    tail = bytes(data[idx + plen: idx + plen + 1])
+    if tail in (b"", b"\x00"):
+        # standalone string -> "." then pad with NULs
+        replacement = b"." + b"\x00" * (plen - 1)
+    else:
+        # prefix of a longer string -> repeat "./" so the suffix
+        # (e.g. "/injected-bundle/") still resolves relative to this dir
+        replacement = (b"./" * (plen // 2 + 1))[:plen]
+    data[idx:idx + plen] = replacement
+
+library.write_bytes(bytes(data))
 PY
 
 if find "$appdir/usr/lib" \( -type f -o -type l \) -name 'libwayland-*.so*' | grep -q .; then
