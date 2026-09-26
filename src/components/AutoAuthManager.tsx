@@ -33,7 +33,7 @@ export function AutoAuthManager({ profile, available, disabled, onMessage }: Pro
       setRules(await api.saveAutoAuthRule(profile.id, { ...draft, password: draft.password || undefined }));
       setDraft(empty);
       setEditing(false);
-      onMessage("AutoAuth settings saved. The password is protected by Windows Credential Manager.");
+      onMessage("AutoAuth settings saved. The password is protected by the system credential store.");
     } catch (error) {
       onMessage(error instanceof Error ? error.message : "AutoAuth could not be saved.", true);
     }

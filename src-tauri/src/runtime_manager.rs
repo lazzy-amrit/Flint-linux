@@ -455,10 +455,15 @@ fn extract_archive(archive_path: &Path, destination: &Path) -> Result<()> {
             runtime_error("Flint rejected a corrupt Java runtime archive.", error)
         })?;
         let entry_type = entry.header().entry_type();
-        if entry_type.is_symlink() || entry_type.is_hard_link() {
+        // Real Temurin/OpenJDK Linux tarballs legitimately contain symlinks
+        // (mainly under legal/, where shared license text is symlinked
+        // instead of duplicated per module). Rejecting every symlink broke
+        // every real download. Hard links are rare in these archives and
+        // harder to validate safely, so those stay rejected.
+        if entry_type.is_hard_link() {
             return Err(AppError::new(
                 "runtime_archive_symlink",
-                "Flint rejected a Java runtime archive containing links.",
+                "Flint rejected a Java runtime archive containing hard links.",
             ));
         }
         let relative = entry
@@ -485,7 +490,7 @@ fn extract_archive(archive_path: &Path, destination: &Path) -> Result<()> {
                 "Flint rejected an unexpectedly large Java runtime archive.",
             ));
         }
-        let output = destination.join(relative);
+        let output = destination.join(&relative);
         if entry_type.is_dir() {
             fs::create_dir_all(output)?;
             continue;
@@ -493,9 +498,71 @@ fn extract_archive(archive_path: &Path, destination: &Path) -> Result<()> {
         if let Some(parent) = output.parent() {
             fs::create_dir_all(parent)?;
         }
-        let mut target = fs::File::create(output)?;
+        if entry_type.is_symlink() {
+            let Some(link_target) = entry.link_name().map_err(|error| {
+                runtime_error("Flint rejected a corrupt Java runtime archive.", error)
+            })?
+            else {
+                return Err(AppError::new(
+                    "runtime_archive_traversal",
+                    "Flint rejected a Java runtime archive with an unresolvable link.",
+                ));
+            };
+            if link_target.is_absolute() {
+                return Err(AppError::new(
+                    "runtime_archive_traversal",
+                    "Flint rejected a Java runtime archive with an absolute link target.",
+                ));
+            }
+            // Resolve the link lexically, relative to its own location inside
+            // the archive, and make sure it can never climb above the
+            // destination root before it descends back in.
+            let mut resolved: Vec<std::ffi::OsString> = relative
+                .parent()
+                .into_iter()
+                .flat_map(|parent| parent.components())
+                .map(|component| component.as_os_str().to_owned())
+                .collect();
+            for component in link_target.components() {
+                match component {
+                    Component::ParentDir => {
+                        if resolved.pop().is_none() {
+                            return Err(AppError::new(
+                                "runtime_archive_traversal",
+                                "Flint rejected a Java runtime archive with a link outside the archive.",
+                            ));
+                        }
+                    }
+                    Component::Normal(part) => resolved.push(part.to_owned()),
+                    Component::CurDir => {}
+                    _ => {
+                        return Err(AppError::new(
+                            "runtime_archive_traversal",
+                            "Flint rejected a Java runtime archive with an unsafe link target.",
+                        ));
+                    }
+                }
+            }
+            #[cfg(unix)]
+            std::os::unix::fs::symlink(&link_target, &output)?;
+            continue;
+        }
+        let mode = entry.header().mode().map_err(|error| {
+            runtime_error("Flint rejected a corrupt Java runtime archive.", error)
+        })?;
+        let mut target = fs::File::create(&output)?;
         std::io::copy(&mut entry, &mut target)?;
         target.flush()?;
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            // Preserve executable bits needed by Java helpers such as
+            // lib/jspawnhelper, while stripping group/world write access.
+            fs::set_permissions(
+                &output,
+                fs::Permissions::from_mode(mode & 0o755),
+            )?;
+        }
     }
     Ok(())
 }
@@ -520,7 +587,7 @@ fn find_java_executable(root: &Path) -> Option<PathBuf> {
 fn set_linux_executable(path: &Path) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
     let mut permissions = fs::metadata(path)?.permissions();
-    permissions.set_mode(permissions.mode() | 0o755);
+    permissions.set_mode(permissions.mode() | 0o100);
     fs::set_permissions(path, permissions)?;
     Ok(())
 }
@@ -728,13 +795,38 @@ mod tests {
         let encoder = flate2::write::GzEncoder::new(file, flate2::Compression::default());
         let mut builder = tar::Builder::new(encoder);
         let mut header = tar::Header::new_gnu();
-        header.set_path("../outside").unwrap();
+        header.as_mut_bytes()[..11].copy_from_slice(b"../outside\0");
         header.set_size(3);
         header.set_cksum();
         builder.append(&header, &b"bad"[..]).unwrap();
         builder.into_inner().unwrap().finish().unwrap();
         let error = extract_archive(&archive, &temp.path().join("out")).unwrap_err();
         assert_eq!(error.code, "runtime_archive_traversal");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn tar_extraction_preserves_runtime_helper_executable_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let archive = temp.path().join("runtime.tar.gz");
+        let file = fs::File::create(&archive).unwrap();
+        let encoder = flate2::write::GzEncoder::new(file, flate2::Compression::default());
+        let mut builder = tar::Builder::new(encoder);
+        let mut header = tar::Header::new_gnu();
+        header.set_path("jdk/lib/jspawnhelper").unwrap();
+        header.set_size(4);
+        header.set_mode(0o755);
+        header.set_cksum();
+        builder.append(&header, &b"exec"[..]).unwrap();
+        builder.into_inner().unwrap().finish().unwrap();
+
+        let destination = temp.path().join("out");
+        extract_archive(&archive, &destination).unwrap();
+        let helper = destination.join("jdk/lib/jspawnhelper");
+        let mode = fs::metadata(helper).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o755);
     }
 
     #[test]
