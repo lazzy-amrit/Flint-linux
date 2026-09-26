@@ -1,0 +1,7 @@
+{
+  "name": "flint-builder",
+  "build": {
+    "dockerfile": "../packaging/Dockerfile",
+    "context": ".."
+  }
+}
