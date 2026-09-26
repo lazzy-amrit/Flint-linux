@@ -179,7 +179,7 @@ pub async fn prepare(
                 &target,
             )
             .await?;
-            if library.name.contains(":natives-windows") {
+            if native_artifact_matches_platform(&library.name) {
                 let family = if library.name.starts_with("org.lwjgl:") {
                     "lwjgl"
                 } else if library.name.starts_with("io.netty:") {
@@ -193,11 +193,7 @@ pub async fn prepare(
             }
             classpath.push(target);
         }
-        if let Some(template) = library
-            .natives
-            .as_ref()
-            .and_then(|items| items.get("windows"))
-        {
+        if let Some(template) = native_template(&library) {
             let arch = if cfg!(target_arch = "x86_64") {
                 "64"
             } else {
@@ -362,4 +358,51 @@ fn extract_native(
         io::copy(&mut entry, &mut target)?;
     }
     Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn native_artifact_matches_platform(name: &str) -> bool {
+    name.contains(":natives-windows")
+}
+
+#[cfg(target_os = "linux")]
+fn native_artifact_matches_platform(name: &str) -> bool {
+    name.contains(":natives-linux")
+}
+
+#[cfg(target_os = "windows")]
+fn native_template(library: &Library) -> Option<&str> {
+    library.natives.as_ref()?.get("windows").map(String::as_str)
+}
+
+#[cfg(target_os = "linux")]
+fn native_template(library: &Library) -> Option<&str> {
+    library.natives.as_ref()?.get("linux").map(String::as_str)
+}
+
+#[cfg(test)]
+mod platform_native_tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn selects_linux_native_classifier_when_both_platforms_exist() {
+        let library = Library {
+            name: "org.lwjgl:lwjgl:3.3.3".into(),
+            downloads: LibraryDownloads {
+                artifact: None,
+                classifiers: HashMap::new(),
+            },
+            natives: Some(HashMap::from([
+                ("windows".into(), "lwjgl-windows-${arch}".into()),
+                ("linux".into(), "lwjgl-linux-${arch}".into()),
+            ])),
+            rules: None,
+            extract: None,
+        };
+        assert_eq!(native_template(&library), Some("lwjgl-linux-${arch}"));
+        assert!(!native_artifact_matches_platform("org.lwjgl:lwjgl:natives-windows"));
+        assert!(native_artifact_matches_platform("org.lwjgl:lwjgl:natives-linux"));
+    }
 }

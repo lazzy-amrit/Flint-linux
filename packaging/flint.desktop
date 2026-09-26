@@ -1,0 +1,8 @@
+[Desktop Entry]
+Name=Flint
+Comment=A focused, instance-based Minecraft Java Edition launcher
+Exec=flint
+Icon=flint
+Terminal=false
+Type=Application
+Categories=Game;

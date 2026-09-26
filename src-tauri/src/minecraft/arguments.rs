@@ -7,6 +7,11 @@ use crate::{
 use std::{collections::HashMap, path::Path};
 use uuid::Uuid;
 
+#[cfg(target_os = "windows")]
+const CLASSPATH_SEPARATOR: &str = ";";
+#[cfg(target_os = "linux")]
+const CLASSPATH_SEPARATOR: &str = ":";
+
 pub struct LaunchArguments {
     pub jvm: Vec<String>,
     pub game: Vec<String>,
@@ -25,7 +30,7 @@ pub fn build(
         .chain(std::iter::once(&prepared.client_jar))
         .map(|path| path.to_string_lossy())
         .collect::<Vec<_>>()
-        .join(";");
+        .join(CLASSPATH_SEPARATOR);
     let offline_uuid = Uuid::new_v3(
         &Uuid::NAMESPACE_DNS,
         format!("OfflinePlayer:{}", profile.username).as_bytes(),
@@ -59,7 +64,10 @@ pub fn build(
         ("${launcher_name}", "Flint".into()),
         ("${launcher_version}", env!("CARGO_PKG_VERSION").into()),
         ("${classpath}", classpath.clone()),
-        ("${classpath_separator}", ";".into()),
+        (
+            "${classpath_separator}",
+            CLASSPATH_SEPARATOR.into(),
+        ),
         (
             "${library_directory}",
             paths.libraries.to_string_lossy().into_owned(),
@@ -129,5 +137,11 @@ mod tests {
             ("${version}", "1".to_string()),
         ]);
         assert_eq!(substitute("${name}-${version}".into(), &values), "Flint-1");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_uses_colon_for_classpaths() {
+        assert_eq!(CLASSPATH_SEPARATOR, ":");
     }
 }

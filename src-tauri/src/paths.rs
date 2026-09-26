@@ -20,7 +20,7 @@ impl AppPaths {
         let project = ProjectDirs::from("dev", "Flint", "Flint").ok_or_else(|| {
             AppError::new(
                 "app_data_unavailable",
-                "Windows did not provide an application-data directory.",
+                "The operating system did not provide an application-data directory.",
             )
         })?;
         Ok(Self::at(project.data_dir()))

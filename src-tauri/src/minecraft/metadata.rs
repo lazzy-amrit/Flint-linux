@@ -175,7 +175,15 @@ pub fn rules_allow(rules: Option<&[Rule]>) -> bool {
 
 fn rule_matches(rule: &Rule) -> bool {
     if let Some(os) = &rule.os {
-        if os.name.as_deref().is_some_and(|name| name != "windows") {
+        if os.name.as_deref().is_some_and(|name| {
+            if cfg!(target_os = "windows") {
+                name != "windows"
+            } else if cfg!(target_os = "linux") {
+                name != "linux"
+            } else {
+                true
+            }
+        }) {
             return false;
         }
         let arch = if cfg!(target_arch = "x86_64") {
@@ -189,7 +197,7 @@ fn rule_matches(rule: &Rule) -> bool {
             return false;
         }
         if os.version.is_some() {
-            // Version-constrained legacy rules are uncommon; an unknown Windows version must not match.
+            // Version-constrained legacy rules are uncommon; an unknown platform version must not match.
             return false;
         }
     }
@@ -236,6 +244,31 @@ mod tests {
             },
         ];
         assert!(!rules_allow(Some(&rules)));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_rules_match_linux_and_reject_windows() {
+        let linux = Rule {
+            action: RuleAction::Allow,
+            os: Some(OsRule {
+                name: Some("linux".into()),
+                arch: None,
+                version: None,
+            }),
+            features: None,
+        };
+        let windows = Rule {
+            action: RuleAction::Allow,
+            os: Some(OsRule {
+                name: Some("windows".into()),
+                arch: None,
+                version: None,
+            }),
+            features: None,
+        };
+        assert!(rules_allow(Some(&[linux])));
+        assert!(!rules_allow(Some(&[windows])));
     }
 
     #[test]

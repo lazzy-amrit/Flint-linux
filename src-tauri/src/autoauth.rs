@@ -379,7 +379,7 @@ fn credential(reference: &str) -> Result<keyring::Entry> {
 fn credential_error(_error: keyring::Error) -> AppError {
     AppError::new(
         "credential_store_unavailable",
-        "Windows Credential Manager could not complete the AutoAuth operation.",
+        "The system credential store could not complete the AutoAuth operation.",
     )
 }
 

@@ -32,9 +32,11 @@ pub fn list(paths: &AppPaths) -> Vec<JavaInfo> {
         .into_iter()
         .map(|path| (path, JavaSource::Managed))
         .collect::<Vec<_>>();
+    #[cfg(windows)]
     if let Some(home) = std::env::var_os("JAVA_HOME") {
         candidates.push((PathBuf::from(home).join("bin/java.exe"), JavaSource::System));
     }
+    #[cfg(windows)]
     if let Ok(output) = crate::process_command::std_command("where.exe")
         .arg("java.exe")
         .output()
@@ -45,6 +47,7 @@ pub fn list(paths: &AppPaths) -> Vec<JavaInfo> {
                 .map(|path| (PathBuf::from(path), JavaSource::System)),
         );
     }
+    #[cfg(windows)]
     for root in [
         r"C:\Program Files\Eclipse Adoptium",
         r"C:\Program Files\Java",
@@ -57,6 +60,7 @@ pub fn list(paths: &AppPaths) -> Vec<JavaInfo> {
                 .map(|path| (path, JavaSource::System)),
         );
     }
+    #[cfg(windows)]
     if let Some(local_app_data) = std::env::var_os("LOCALAPPDATA") {
         candidates.extend(
             java_children(&PathBuf::from(local_app_data).join(r"Programs\Eclipse Adoptium"))
@@ -64,12 +68,30 @@ pub fn list(paths: &AppPaths) -> Vec<JavaInfo> {
                 .map(|path| (path, JavaSource::System)),
         );
     }
+    #[cfg(target_os = "linux")]
+    {
+        if let Some(home) = std::env::var_os("JAVA_HOME") {
+            candidates.push((PathBuf::from(home).join("bin/java"), JavaSource::System));
+        }
+        if let Some(path) = std::env::var_os("PATH") {
+            candidates.extend(std::env::split_paths(&path).map(|directory| {
+                (directory.join("java"), JavaSource::System)
+            }));
+        }
+        for root in linux_java_roots() {
+            candidates.extend(
+                linux_java_candidates(&root)
+                    .into_iter()
+                    .map(|path| (path, JavaSource::System)),
+            );
+        }
+    }
     let mut seen_paths = HashSet::new();
     let mut seen_installations = HashSet::new();
     let mut detected = Vec::new();
     for (candidate, source) in candidates {
         let path_key = normalized_path(&candidate);
-        if !candidate.is_file() || !seen_paths.insert(path_key) {
+        if !is_candidate_executable(&candidate) || !seen_paths.insert(path_key) {
             continue;
         }
         if let Some((info, installation_key)) = inspect_with_identity(&candidate, source) {
@@ -110,6 +132,7 @@ pub fn detect(
     Ok(selected)
 }
 
+#[cfg(windows)]
 fn java_children(root: &Path) -> Vec<PathBuf> {
     std::fs::read_dir(root)
         .into_iter()
@@ -117,6 +140,70 @@ fn java_children(root: &Path) -> Vec<PathBuf> {
         .flatten()
         .map(|entry| entry.path().join("bin/java.exe"))
         .collect()
+}
+
+#[cfg(target_os = "linux")]
+fn java_children(root: &Path) -> Vec<PathBuf> {
+    std::fs::read_dir(root)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|entry| entry.path().join("bin/java"))
+        .collect()
+}
+
+#[cfg(target_os = "linux")]
+fn linux_java_roots() -> Vec<PathBuf> {
+    let mut roots = vec![PathBuf::from("/usr/lib/jvm")];
+    if let Some(home) = std::env::var_os("HOME") {
+        let home = PathBuf::from(home);
+        roots.push(home.join(".sdkman/candidates/java"));
+        roots.push(home.join(".var/app"));
+    }
+    roots.extend([
+        PathBuf::from("/var/lib/flatpak/app"),
+        PathBuf::from("/snap"),
+        PathBuf::from("/opt"),
+    ]);
+    roots
+}
+
+#[cfg(target_os = "linux")]
+fn linux_java_candidates(root: &Path) -> Vec<PathBuf> {
+    let mut candidates = java_children(root);
+    let mut pending = vec![(root.to_path_buf(), 0_u8)];
+    while let Some((directory, depth)) = pending.pop() {
+        if depth >= 5 {
+            continue;
+        }
+        let Ok(entries) = std::fs::read_dir(directory) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.join("bin/java").is_file() {
+                candidates.push(path.join("bin/java"));
+            }
+            if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                pending.push((path, depth + 1));
+            }
+        }
+    }
+    candidates
+}
+
+#[cfg(windows)]
+fn is_candidate_executable(path: &Path) -> bool {
+    path.is_file()
+}
+
+#[cfg(target_os = "linux")]
+fn is_candidate_executable(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    path.is_file()
+        && path
+            .metadata()
+            .is_ok_and(|metadata| metadata.permissions().mode() & 0o111 != 0)
 }
 
 pub fn inspect(path: &Path) -> Option<JavaInfo> {
@@ -273,6 +360,18 @@ mod tests {
         assert_eq!(
             normalized_path(Path::new(r"C:\Java\Temurin\")),
             normalized_path(Path::new(r"c:\java\temurin"))
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn equivalent_linux_paths_share_a_deduplication_key() {
+        let temp = tempfile::tempdir().unwrap();
+        let java_home = temp.path().join("java");
+        std::fs::create_dir_all(&java_home).unwrap();
+        assert_eq!(
+            normalized_path(&java_home),
+            normalized_path(&java_home.join("."))
         );
     }
 

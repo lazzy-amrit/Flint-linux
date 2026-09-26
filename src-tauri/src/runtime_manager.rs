@@ -81,7 +81,7 @@ pub async fn select_or_prepare(
         .join(format!(".staging-java-{required_major}-{}", Uuid::new_v4()));
     fs::create_dir_all(&staging)?;
     let _cleanup = StagingCleanup(staging.clone());
-    let archive = staging.join("runtime.zip");
+    let archive = staging.join(runtime_archive_filename());
     install::emit(
         app,
         "downloading",
@@ -115,8 +115,10 @@ pub async fn select_or_prepare(
             "runtime_java_missing",
             format!("Flint couldn't prepare Java {required_major}."),
         )
-        .with_detail("The verified Temurin archive did not contain bin/java.exe.")
+        .with_detail(runtime_missing_binary_detail())
     })?;
+    #[cfg(target_os = "linux")]
+    set_linux_executable(&staged_java)?;
     let inspected = java::inspect(&staged_java).ok_or_else(|| {
         AppError::new(
             "runtime_verification_failed",
@@ -198,7 +200,7 @@ async fn resolve_temurin_asset(client: &reqwest::Client, major: u32) -> Result<R
             .query(&[
                 ("architecture", "x64"),
                 ("image_type", image_type),
-                ("os", "windows"),
+                ("os", target_os_name()),
                 ("vendor", "eclipse"),
             ])
             .send()
@@ -223,7 +225,10 @@ async fn resolve_temurin_asset(client: &reqwest::Client, major: u32) -> Result<R
         "runtime_unavailable",
         format!("Flint couldn't prepare Java {major}."),
     )
-    .with_detail("Eclipse Adoptium did not offer a Windows x64 Temurin runtime."))
+    .with_detail(format!(
+        "Eclipse Adoptium did not offer a {} x64 Temurin runtime.",
+        target_os_name()
+    )))
 }
 
 fn asset_from_releases(releases: Vec<AdoptiumRelease>) -> Option<RuntimeAsset> {
@@ -239,8 +244,10 @@ fn asset_from_releases(releases: Vec<AdoptiumRelease>) -> Option<RuntimeAsset> {
                 .bytes()
                 .all(|byte| byte.is_ascii_hexdigit());
         (binary.architecture == "x64"
-            && binary.os == "windows"
+            && binary.os == target_os_name()
             && matches!(binary.image_type.as_str(), "jre" | "jdk")
+            && ((cfg!(target_os = "windows") && package.name.ends_with(".zip"))
+                || (cfg!(target_os = "linux") && package.name.ends_with(".tar.gz")))
             && secure
             && checksum_valid
             && package.size > 0
@@ -348,6 +355,7 @@ fn checksum_error(expected: &str, actual: &str) -> AppError {
     .with_detail(format!("Expected SHA-256 {expected}, received {actual}."))
 }
 
+#[cfg(windows)]
 fn extract_archive(archive_path: &Path, destination: &Path) -> Result<()> {
     fs::create_dir_all(destination)?;
     let file = fs::File::open(archive_path)?;
@@ -410,6 +418,7 @@ fn extract_archive(archive_path: &Path, destination: &Path) -> Result<()> {
     Ok(())
 }
 
+#[cfg(windows)]
 fn find_java_executable(root: &Path) -> Option<PathBuf> {
     let direct = root.join("bin/java.exe");
     if direct.is_file() {
@@ -423,6 +432,127 @@ fn find_java_executable(root: &Path) -> Option<PathBuf> {
             let candidate = entry.path().join("bin/java.exe");
             candidate.is_file().then_some(candidate)
         })
+}
+
+#[cfg(target_os = "linux")]
+fn extract_archive(archive_path: &Path, destination: &Path) -> Result<()> {
+    fs::create_dir_all(destination)?;
+    let file = fs::File::open(archive_path)?;
+    let decoder = flate2::read::GzDecoder::new(file);
+    let mut archive = tar::Archive::new(decoder);
+    let mut extracted = 0_u64;
+    let entries = archive
+        .entries()
+        .map_err(|error| runtime_error("Flint rejected a corrupt Java runtime archive.", error))?;
+    for (index, item) in entries.enumerate() {
+        if index >= MAX_RUNTIME_ENTRIES {
+            return Err(AppError::new(
+                "runtime_archive_too_large",
+                "Flint rejected an unexpectedly large Java runtime archive.",
+            ));
+        }
+        let mut entry = item.map_err(|error| {
+            runtime_error("Flint rejected a corrupt Java runtime archive.", error)
+        })?;
+        let entry_type = entry.header().entry_type();
+        if entry_type.is_symlink() || entry_type.is_hard_link() {
+            return Err(AppError::new(
+                "runtime_archive_symlink",
+                "Flint rejected a Java runtime archive containing links.",
+            ));
+        }
+        let relative = entry
+            .path()
+            .map_err(|error| {
+                runtime_error("Flint rejected a corrupt Java runtime archive.", error)
+            })?
+            .into_owned();
+        if relative.is_absolute()
+            || relative
+                .components()
+                .any(|component| !matches!(component, Component::Normal(_)))
+        {
+            return Err(AppError::new(
+                "runtime_archive_traversal",
+                "Flint rejected an unsafe Java runtime archive.",
+            ));
+        }
+        let size = entry.size();
+        extracted = extracted.saturating_add(size);
+        if extracted > MAX_RUNTIME_BYTES {
+            return Err(AppError::new(
+                "runtime_archive_too_large",
+                "Flint rejected an unexpectedly large Java runtime archive.",
+            ));
+        }
+        let output = destination.join(relative);
+        if entry_type.is_dir() {
+            fs::create_dir_all(output)?;
+            continue;
+        }
+        if let Some(parent) = output.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let mut target = fs::File::create(output)?;
+        std::io::copy(&mut entry, &mut target)?;
+        target.flush()?;
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn find_java_executable(root: &Path) -> Option<PathBuf> {
+    let direct = root.join("bin/java");
+    if direct.is_file() {
+        return Some(direct);
+    }
+    fs::read_dir(root)
+        .ok()?
+        .filter_map(std::result::Result::ok)
+        .filter(|entry| entry.path().is_dir())
+        .find_map(|entry| {
+            let candidate = entry.path().join("bin/java");
+            candidate.is_file().then_some(candidate)
+        })
+}
+
+#[cfg(target_os = "linux")]
+fn set_linux_executable(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let mut permissions = fs::metadata(path)?.permissions();
+    permissions.set_mode(permissions.mode() | 0o755);
+    fs::set_permissions(path, permissions)?;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn runtime_archive_filename() -> &'static str {
+    "runtime.zip"
+}
+
+#[cfg(target_os = "linux")]
+fn runtime_archive_filename() -> &'static str {
+    "runtime.tar.gz"
+}
+
+#[cfg(windows)]
+fn runtime_missing_binary_detail() -> &'static str {
+    "The verified Temurin archive did not contain bin/java.exe."
+}
+
+#[cfg(target_os = "linux")]
+fn runtime_missing_binary_detail() -> &'static str {
+    "The verified Temurin archive did not contain bin/java."
+}
+
+#[cfg(windows)]
+fn target_os_name() -> &'static str {
+    "windows"
+}
+
+#[cfg(target_os = "linux")]
+fn target_os_name() -> &'static str {
+    "linux"
 }
 
 fn runtime_target(paths: &AppPaths, major: u32) -> PathBuf {
@@ -496,6 +626,7 @@ mod tests {
     use super::*;
     use std::io::Write;
 
+    #[cfg(windows)]
     fn write_zip(path: &Path, entries: &[(&str, &[u8])]) {
         let file = fs::File::create(path).unwrap();
         let mut archive = zip::ZipWriter::new(file);
@@ -508,6 +639,7 @@ mod tests {
         archive.finish().unwrap();
     }
 
+    #[cfg(windows)]
     #[test]
     fn provider_metadata_requires_windows_x64_https_and_checksum() {
         let release = AdoptiumRelease {
@@ -540,6 +672,25 @@ mod tests {
         assert!(asset_from_releases(vec![insecure]).is_none());
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn provider_metadata_requires_linux_x64_tarball() {
+        let release = AdoptiumRelease {
+            binary: AdoptiumBinary {
+                architecture: "x64".into(),
+                image_type: "jre".into(),
+                os: "linux".into(),
+                package: AdoptiumPackage {
+                    checksum: "a".repeat(64),
+                    link: "https://example.test/runtime.tar.gz".into(),
+                    name: "runtime.tar.gz".into(),
+                    size: 42,
+                },
+            },
+        };
+        assert!(asset_from_releases(vec![release]).is_some());
+    }
+
     #[test]
     fn checksum_mismatch_is_rejected() {
         let temp = tempfile::tempdir().unwrap();
@@ -557,6 +708,7 @@ mod tests {
         assert!(extract_archive(&archive, &temp.path().join("out")).is_err());
     }
 
+    #[cfg(windows)]
     #[test]
     fn archive_traversal_is_rejected() {
         let temp = tempfile::tempdir().unwrap();
@@ -565,6 +717,24 @@ mod tests {
         let error = extract_archive(&archive, &temp.path().join("out")).unwrap_err();
         assert_eq!(error.code, "runtime_archive_traversal");
         assert!(!temp.path().join("outside.exe").exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn tar_archive_traversal_is_rejected() {
+        let temp = tempfile::tempdir().unwrap();
+        let archive = temp.path().join("runtime.tar.gz");
+        let file = fs::File::create(&archive).unwrap();
+        let encoder = flate2::write::GzEncoder::new(file, flate2::Compression::default());
+        let mut builder = tar::Builder::new(encoder);
+        let mut header = tar::Header::new_gnu();
+        header.set_path("../outside").unwrap();
+        header.set_size(3);
+        header.set_cksum();
+        builder.append(&header, &b"bad"[..]).unwrap();
+        builder.into_inner().unwrap().finish().unwrap();
+        let error = extract_archive(&archive, &temp.path().join("out")).unwrap_err();
+        assert_eq!(error.code, "runtime_archive_traversal");
     }
 
     #[test]

@@ -81,7 +81,7 @@ pub async fn apply(
         .await?;
     for library in profile.libraries {
         let relative = maven_path(&library.name)?;
-        let url = format!("{}{relative}", library.url.trim_end_matches('/'));
+        let url = format!("{}/{relative}", library.url.trim_end_matches('/'));
         let sha1 = if library.sha1.is_empty() {
             client
                 .get(format!("{url}.sha1"))
@@ -146,7 +146,7 @@ fn maven_path(coordinate: &str) -> Result<String> {
         .map(|value| format!("-{value}"))
         .unwrap_or_default();
     Ok(format!(
-        "/{group}/{artifact}/{version}/{artifact}-{version}{classifier}.jar"
+        "{group}/{artifact}/{version}/{artifact}-{version}{classifier}.jar"
     ))
 }
 
@@ -158,7 +158,7 @@ mod tests {
     fn converts_maven_coordinate_to_repository_path() {
         assert_eq!(
             maven_path("net.fabricmc:fabric-loader:0.19.5").unwrap(),
-            "/net/fabricmc/fabric-loader/0.19.5/fabric-loader-0.19.5.jar"
+            "net/fabricmc/fabric-loader/0.19.5/fabric-loader-0.19.5.jar"
         );
     }
 

@@ -1,0 +1,10 @@
+.git
+.codex
+.agents
+node_modules
+dist
+target
+src-tauri/target
+AppDir
+*.AppImage
+*.log
